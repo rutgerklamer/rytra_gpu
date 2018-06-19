@@ -1,22 +1,7 @@
-/* OpenCL based simple sphere path tracer by Sam Lapere, 2016*/
-/* based on smallpt by Kevin Beason */
-/* http://raytracey.blogspot.com */
-
-__constant float EPSILON = 0.00003f; /* required to compensate for limited float precision */
+__constant float EPSILON = 0.00003f; 
 __constant float PI = 3.14159265359f;
 __constant int SAMPLES = 128;
-
-typedef struct Ray{
-	float3 origin;
-	float3 dir;
-} Ray;
-
-typedef struct Sphere{
-	float radius;
-	float3 pos;
-	float3 color;
-	float3 emission;
-} Sphere;
+__constant float MAX_FLOAT = 3.402823466e+38F;
 
 static float get_random(unsigned int *seed0, unsigned int *seed1) {
 
@@ -36,152 +21,197 @@ static float get_random(unsigned int *seed0, unsigned int *seed1) {
 	return (res.f - 2.0f) / 2.0f;
 }
 
-Ray createCamRay(const int x_coord, const int y_coord, const int width, const int height){
+enum Mat { LAMB, MET };
 
-	float fx = (float)x_coord / (float)width;  /* convert int in range [0 - width] to float in range [0-1] */
-	float fy = (float)y_coord / (float)height; /* convert int in range [0 - height] to float in range [0-1] */
+struct Material {
+	enum Mat mat;
+	float3 color;
+};
 
-	/* calculate aspect ratio */
-	float aspect_ratio = (float)(width) / (float)(height);
-	float fx2 = (fx - 0.5f) * aspect_ratio;
-	float fy2 = fy - 0.5f;
+struct Ray {
+ float3 origin;
+ float3 direction;
+};
 
-	/* determine position of pixel on screen */
-	float3 pixel_pos = (float3)(fx2, -fy2, 0.0f);
+struct Hit_record {
+	float t;
+	float3 p;
+	float3 normal;
+	struct Material* mat_ptr;
+};
 
-	/* create camera ray*/
-	Ray ray;
-	ray.origin = (float3)(0.0f, 0.1f, 2.0f); /* fixed camera position */
-	ray.dir = normalize(pixel_pos - ray.origin); /* vector from camera to pixel on screen */
+struct Sphere {
+	struct Hit_record hit_record;
+	float3 center;
+	float radius;
+};
 
-	return ray;
+struct Hitable_list {
+	struct Sphere* spheres[5];
+};
+
+struct Camera {
+	float3 lower_left_corner;
+	float3 horizontal;
+	float3 vertical;
+	float3 origin;
+};
+
+float3 get_float(float x, float y, float z) {
+		float3 w = {x,y,z};
+		return w;
 }
 
-				/* (__global Sphere* sphere, const Ray* ray) */
-float intersect_sphere(const Sphere* sphere, const Ray* ray) /* version using local copy of sphere */
-{
-	float3 rayToCenter = sphere->pos - ray->origin;
-	float b = dot(rayToCenter, ray->dir);
-	float c = dot(rayToCenter, rayToCenter) - sphere->radius*sphere->radius;
-	float disc = b * b - c;
-
-	if (disc < 0.0f) return 0.0f;
-	else disc = sqrt(disc);
-
-	if ((b - disc) > EPSILON) return b - disc;
-	if ((b + disc) > EPSILON) return b + disc;
-
-	return 0.0f;
+float3 reflect (float3 v, float3 n) {
+		return v-2.0f*dot(v,n)*n;
 }
 
-bool intersect_scene(__constant Sphere* spheres, const Ray* ray, float* t, int* sphere_id, const int sphere_count)
-{
-	/* initialise t to a very large number, 
-	so t will be guaranteed to be smaller
-	when a hit with the scene occurs */
+bool has_hit_sphere(struct Ray r, float t_min, float t_max, struct Sphere* s, struct Hit_record* hr) {
+		float3 oc = r.origin - s->center;
+		float a = dot(r.direction, r.direction);
+		float b = dot(oc,r.direction);
+		float c = dot(oc,oc)-s->radius*s->radius;
+		float discriminant = b*b-a*c;
+		if (discriminant > 0) {
+			float temp = (-b - sqrt(b*b-a*c))/a;
+			if (temp < t_max && temp > t_min) {
+				hr->t = temp;
+				hr->p = r.origin+get_float(temp,temp,temp)*r.direction;
+				hr->normal = (hr->p - s->center)/s->radius;
+			    hr->mat_ptr = s->hit_record.mat_ptr;
+				return true;
+			}
+			temp = (-b + sqrt(b*b-a*c))/a;
+			if (temp < t_max && temp > t_min) {
+				hr->t = temp;
+				hr->p = r.origin+get_float(temp,temp,temp)*r.direction;
+				hr->normal = (hr->p - s->center)/s->radius;
+				hr->mat_ptr = s->hit_record.mat_ptr;
+				return true;
+			}
 
-	float inf = 1e20f;
-	*t = inf;
-
-	/* check if the ray intersects each sphere in the scene */
-	for (int i = 0; i < sphere_count; i++)  {
-		
-		Sphere sphere = spheres[i]; /* create local copy of sphere */
-		
-		/* float hitdistance = intersect_sphere(&spheres[i], ray); */
-		float hitdistance = intersect_sphere(&sphere, ray);
-		/* keep track of the closest intersection and hitobject found so far */
-		if (hitdistance != 0.0f && hitdistance < *t) {
-			*t = hitdistance;
-			*sphere_id = i;
 		}
-	}
-	return *t < inf; /* true when ray interesects the scene */
+		return false;
 }
 
-
-/* the path tracing function */
-/* computes a path (starting from the camera) with a defined number of bounces, accumulates light/color at each bounce */
-/* each ray hitting a surface will be reflected in a random direction (by randomly sampling the hemisphere above the hitpoint) */
-/* small optimisation: diffuse ray directions are calculated using cosine weighted importance sampling */
-
-float3 trace(__constant Sphere* spheres, const Ray* camray, const int sphere_count, const int* seed0, const int* seed1){
-
-	Ray ray = *camray;
-
-	float3 accum_color = (float3)(0.0f, 0.0f, 0.0f);
-	float3 mask = (float3)(1.0f, 1.0f, 1.0f);
-
-	for (int bounces = 0; bounces < 8; bounces++){
-
-		float t;   /* distance to intersection */
-		int hitsphere_id = 0; /* index of intersected sphere */
-
-		/* if ray misses scene, return background colour */
-		if (!intersect_scene(spheres, &ray, &t, &hitsphere_id, sphere_count))
-			return accum_color += mask * (float3)(0.15f, 0.15f, 0.25f);
-
-		/* else, we've got a hit! Fetch the closest hit sphere */
-		Sphere hitsphere = spheres[hitsphere_id]; /* version with local copy of sphere */
-
-		/* compute the hitpoint using the ray equation */
-		float3 hitpoint = ray.origin + ray.dir * t;
-		
-		/* compute the surface normal and flip it if necessary to face the incoming ray */
-		float3 normal = normalize(hitpoint - hitsphere.pos); 
-		float3 normal_facing = dot(normal, ray.dir) < 0.0f ? normal : normal * (-1.0f);
-
-		/* compute two random numbers to pick a random point on the hemisphere above the hitpoint*/
-		float rand1 = 2.0f * PI * get_random(seed0, seed1);
-		float rand2 = get_random(seed0, seed1);
-		float rand2s = sqrt(rand2);
-
-		/* create a local orthogonal coordinate frame centered at the hitpoint */
-		float3 w = normal_facing;
-		float3 axis = fabs(w.x) > 0.1f ? (float3)(0.0f, 1.0f, 0.0f) : (float3)(1.0f, 0.0f, 0.0f);
-		float3 u = normalize(cross(axis, w));
-		float3 v = cross(w, u);
-
-		/* use the coordinte frame and random numbers to compute the next ray direction */
-		float3 newdir = normalize(u * cos(rand1)*rand2s + v*sin(rand1)*rand2s + w*sqrt(1.0f - rand2));
-
-		/* add a very small offset to the hitpoint to prevent self intersection */
-		ray.origin = hitpoint + normal_facing * EPSILON;
-		ray.dir = newdir;
-
-		/* add the colour and light contributions to the accumulated colour */
-		accum_color += mask * hitsphere.emission; 
-
-		/* the mask colour picks up surface colours at each bounce */
-		mask *= hitsphere.color; 
-		
-		/* perform cosine-weighted importance sampling for diffuse surfaces*/
-		mask *= dot(newdir, normal_facing); 
-	}
-
-	return accum_color;
-}
-
-__kernel void render_kernel(__constant Sphere* spheres, const int width, const int height, const int sphere_count, __global float3* output)
+bool world_hit(struct Ray r, float t_min, float t_max, struct Hit_record* hr,  struct Hitable_list hl)
 {
-	unsigned int work_item_id = get_global_id(0);	/* the unique global id of the work item for the current pixel */
-	unsigned int x_coord = work_item_id % width;			/* x-coordinate of the pixel */
-	unsigned int y_coord = work_item_id / width;			/* y-coordinate of the pixel */
+		struct Hit_record temp_rec;
+		bool hit_anything = false;
+		float closest_so_far = t_max;
+		for (int i = 0; i < 5; i++) {
+				if (has_hit_sphere(r, t_min, closest_so_far, hl.spheres[i], &temp_rec)) {
+					hit_anything = true;
+					closest_so_far = temp_rec.t;
+					*hr = temp_rec;
+				}
+		}
+	return hit_anything;
+}
+
+float hit_sphere(float3 center, float radius, struct Ray r, struct Hit_record hr) {
+	float3 oc = r.origin - center;
+	float a = dot(r.direction, r.direction);
+	float b = 2.0*dot(oc,r.direction);
+	float c = dot(oc,oc)-radius*radius;
+	float discriminant = b*b-4*a*c;
+	if (discriminant<0.0f)
+		return -1.0f;
+	else
+		return(-b - sqrt(discriminant))/(2.0*a);
+}
+
+bool scatter_ray_metal(struct Ray r, struct Hit_record hr, float3* attenuation, struct Ray* scattered, struct Material* mats) 
+{
+	float3 reflected = reflect(normalize(r.direction), hr.normal);
+	scattered->origin = hr.p;
+	scattered->direction = reflected;
+	*attenuation = mats->color;
+	return (dot(reflected, hr.normal)>0);
+}
+
+bool scatter_ray_lambertian(struct Ray r, struct Hit_record hr, float3* attenuation, struct Ray* scattered, struct Material* mats, const int* seed0, const int* seed1) 
+{
+	float3 target = hr.p + hr.normal + normalize(2.0f*get_float(get_random(seed0,seed1), get_random(seed0,seed1), get_random(seed0,seed1)));
+	scattered->origin = hr.p;
+	scattered->direction = target-hr.p;
+    *attenuation = mats->color;
+    return true;
+}
+
+
+float3 get_color(struct Ray r, struct Hitable_list hl, const int* seed0, const int* seed1, int depth) {
+	struct Hit_record rec;
+	if (world_hit(r, 0.001, MAX_FLOAT , &rec,  hl)) {
+		struct Ray scattered;
+		float3 attenuation;
+		if (depth < 5 && rec.mat_ptr->mat == MET && scatter_ray_metal(r, rec, &attenuation, &scattered, rec.mat_ptr)) {
+			return (attenuation)*get_color(scattered,hl,seed0,seed1,depth+1);
+		} else if (depth < 5 && rec.mat_ptr->mat == LAMB && scatter_ray_lambertian(r, rec, &attenuation, &scattered, rec.mat_ptr, seed0, seed1)) { 
+			return (attenuation)*get_color(scattered,hl,seed0,seed1,depth+1);
+		} else {
+			return rec.mat_ptr->color;
+		}
+	} else {
+		float3 unit_direction = normalize(r.direction);
+		float t = 0.5*(unit_direction.y+1.0);
+		return get_float((1.0-t),(1.0-t),(1.0-t))*get_float(1,1,1)+get_float(t,t,t)*get_float(0.5,0.7,1.0);
+	}
+}
+
+struct Ray get_ray(struct Camera c, float u, float v)
+{
+	struct Ray r;
+	r.origin = c.origin;
+	r.direction = c.lower_left_corner + get_float(u,u,u) * c.horizontal + get_float(v,v,v) * c.vertical - c.origin;
+	return r;
+}
+
+
+__kernel void render_kernel(__global float3* output, int width, int height, int randss, float ysphere, float xsphere)
+{
+	const int work_item_id = get_global_id(0); 
+	int x = work_item_id % width; 
+	int y = height - work_item_id / width % height; 
 	
-	/* seeds for random number generator */
-	unsigned int seed0 = x_coord;
-	unsigned int seed1 = y_coord;
+	float u = (float)x / (float)width;
+	float v = (float)y / (float)height;
+ 	struct Camera cam = { get_float(-2.0,-1.0,-1.0), get_float(4.0,0.0,0.0), get_float(0.0,2.0,0.0), get_float(0.0,0.0,0.0) };
+	
+	unsigned int seed0 = x *randss;
+	unsigned int seed1 = y *randss;
+	
+	struct Ray ray = get_ray(cam, u, v);
+	struct Material red = { LAMB, get_float(0.8,0.6,0.2)} ;
+	struct Material blue = { MET, get_float(0.8,0.8,0.8)} ;
+	struct Hit_record hit_record_red = { 0.0f, get_float(0.0f,0.0f,0.0f), get_float(0.0f,0.0f,0.0f), &red};
+	struct Hit_record hit_record_blue = { 0.0f, get_float(0.0f,0.0f,0.0f), get_float(0.0f,0.0f,0.0f), &blue};
+	
+	struct Sphere sphere = {hit_record_red, get_float(xsphere,ysphere,-1.0f),0.5f};
+	
+	struct Sphere sphere2 = {hit_record_blue, get_float(-1.0f,-0.5f,-1.0f),0.5f};
+	struct Sphere sphere3 = {hit_record_blue, get_float(0,ysphere-1.0,-1.0f),0.5f};
+	
+	struct Sphere sphere4 = {hit_record_blue, get_float(0.0f,1.0f,-1.0f),0.5f};
+	struct Sphere sphere5 = {hit_record_red, get_float(xsphere+1.0,ysphere,-1.0f),0.5f};
+	
+	struct Hitable_list hitable_list;
+	hitable_list.spheres[0] = &sphere;
+	hitable_list.spheres[1] = &sphere2;
+	hitable_list.spheres[2] = &sphere3;
+	hitable_list.spheres[3] = &sphere4;
+	hitable_list.spheres[4] = &sphere5;
 
-	Ray camray = createCamRay(x_coord, y_coord, width, height);
-
-	/* add the light contribution of each sample and average over all samples*/
-	float3 finalcolor = (float3)(0.0f, 0.0f, 0.0f);
-	float invSamples = 1.0f / SAMPLES;
-
-	for (int i = 0; i < SAMPLES; i++)
-		finalcolor += trace(spheres, &camray, sphere_count, &seed0, &seed1) * invSamples;
-
-	/* store the pixelcolour in the output buffer */
-	output[work_item_id] = finalcolor;
+	int samples = 10;
+	float3 col = {0,0,0};
+	for (int s = 0; s < samples; s++) {
+			col += get_color(ray, hitable_list, &seed0, &seed1, 0);
+			seed0+=randss;
+			seed1-=randss;
+	}
+	col /= samples;
+	col = get_float(sqrt(col.x), sqrt(col.y), sqrt(col.z));
+	
+	output[work_item_id] = col; 
 }
 
