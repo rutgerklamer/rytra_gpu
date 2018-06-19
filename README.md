@@ -5,6 +5,8 @@ Rytra is work in progress raytracing utility for rendering real tim images.
 
 It's progress is in the most early stage you can think off and comes without any optimizations. (for now)
 
+![](src.png)
+
 
 Building
 -----
