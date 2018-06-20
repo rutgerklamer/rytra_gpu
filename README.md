@@ -1,7 +1,7 @@
 Rytra
 ====
 
-Rytra is work in progress raytracing utility for rendering real tim images.
+Rytra is a work in progress raytracing utility for rendering real time images.
 
 It's progress is in the most early stage you can think off and comes without any optimizations. (for now)
 
