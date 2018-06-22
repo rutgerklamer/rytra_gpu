@@ -5,7 +5,7 @@ Rytra is a work in progress raytracing utility for rendering real time images.
 
 It's progress is in the most early stage you can think off and comes without any optimizations. (for now)
 
-Rendered on a Georce gtx 780 ti ~13 fps, ~0.076s to draw an image.
+Rendered on a Georce gtx 780 ti ~13 fps, ~0.076s to draw an image. 100 spp (samples per pixel) and a rrd (ray reflection depth) of 4 
 
 ![](scr.png?raw=true)
 
